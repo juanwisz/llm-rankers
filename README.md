@@ -1,1 +1,2 @@
-# sorting_with_llms
+# llm-rankers
+Document Ranking with Large Language Models.
