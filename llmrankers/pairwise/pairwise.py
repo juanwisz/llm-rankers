@@ -13,6 +13,19 @@ import openai
 import time
 import re
 
+class ComparableDoc:
+    def __init__(self, docid, text, ranker, query):
+        self.docid = docid
+        self.text = text
+        self.ranker = ranker
+        self.query = query
+
+    def __gt__(self, other):
+        out = self.ranker.compare(self.query, [self.text, other.text])
+        if out[0] == "Passage A" and out[1] == "Passage B":
+            return True
+        else:
+            return False
 
 class Text2TextGenerationDataset(Dataset):
     def __init__(self, data: List[str], tokenizer: T5Tokenizer):
@@ -219,37 +232,11 @@ Output Passage A or Passage B:"""
                              key=lambda x: x.score, reverse=True)
 
         elif self.method == "heapsort":
-            class ComparableDoc:
-                def __init__(self, docid, text, ranker):
-                    self.docid = docid
-                    self.text = text
-                    self.ranker = ranker
 
-                def __gt__(self, other):
-                    out = self.ranker.compare(query, [self.text, other.text])
-                    if out[0] == "Passage A" and out[1] == "Passage B":
-                        return True
-                    else:
-                        return False
-
-            arr = [ComparableDoc(docid=doc.docid, text=doc.text, ranker=self) for doc in ranking]
+            arr = [ComparableDoc(docid=doc.docid, text=doc.text, ranker=self, query) for doc in ranking]
             self.heapSort(arr, self.k)
             ranking = [SearchResult(docid=doc.docid, score=-i, text=None) for i, doc in enumerate(reversed(arr))]
 
-        #
-        # elif self.method == "bubblesort":
-        #     k = min(k, len(ranking))
-        #     for i in range(k):
-        #         current_ind = len(ranking) - 1
-        #         while True:
-        #             if current_ind == i:
-        #                 break
-        #             doc1 = ranking[current_ind]
-        #             doc2 = ranking[current_ind - 1]
-        #             output = self.compare(query, [doc1.text, doc2.text])
-        #             if output[0] == "Passage A" and output[1] == "Passage B":
-        #                 ranking[current_ind - 1], ranking[current_ind] = ranking[current_ind], ranking[current_ind - 1]
-        #             current_ind -= 1
         elif self.method == "bubblesort":
             k = min(self.k, len(ranking))
 
