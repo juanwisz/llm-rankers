@@ -12,20 +12,8 @@ import tiktoken
 import openai
 import time
 import re
-
-class ComparableDoc:
-    def __init__(self, docid, text, ranker, query):
-        self.docid = docid
-        self.text = text
-        self.ranker = ranker
-        self.query = query
-
-    def __gt__(self, other):
-        out = self.ranker.compare(self.query, [self.text, other.text])
-        if out[0] == "Passage A" and out[1] == "Passage B":
-            return True
-        else:
-            return False
+import pickle
+import os
 
 class Text2TextGenerationDataset(Dataset):
     def __init__(self, data: List[str], tokenizer: T5Tokenizer):
@@ -48,6 +36,7 @@ class PairwiseLlmRanker(LlmRanker):
                  k=10,
                  cache_dir=None
                  ):
+        self.model = model_name_or_path
         self.device = device
         self.method = method
         self.batch_size = batch_size
@@ -94,24 +83,43 @@ Output Passage A or Passage B:"""
         self.total_prompt_tokens = 0
 
     def compare(self, query: str, docs: List):
-        self.total_compare += 1
-        doc1, doc2 = docs[0], docs[1]
-        input_texts = [self.prompt.format(query=query, doc1=doc1, doc2=doc2),
-                       self.prompt.format(query=query, doc1=doc2, doc2=doc1)]
         if self.config.model_type == 't5':
-            input_ids = self.tokenizer(input_texts,
-                                       padding='longest',
-                                       return_tensors="pt").input_ids.to(self.llm.device)
+            # Define the path for the pickle cache file
+            cache_path = 'inference_cache.pkl'
+            
+            # Load the cache if it exists, otherwise create an empty dictionary
+            if os.path.exists(cache_path):
+                with open(cache_path, 'rb') as cache_file:
+                    inference_cache = pickle.load(cache_file)
+            else:
+                inference_cache = {}
+            
+            # Prepare input texts
+            doc1, doc2 = docs[0], docs[1]
+            input_texts = [self.prompt.format(query=query, doc1=doc1, doc2=doc2),
+                        self.prompt.format(query=query, doc1=doc2, doc2=doc1)]
+            
+            # Check if the input_texts are already in the cache
+            cache_key = tuple(input_texts)  # Using a tuple as a dictionary key
+            if cache_key in inference_cache:
+                output = inference_cache[cache_key]
+            else:
+                # Run the model if the result is not in the cache
+                
+                input_ids = self.tokenizer(input_texts,
+                                    padding='longest',
+                                    return_tensors="pt").input_ids.to(self.llm.device)
+                self.total_prompt_tokens += input_ids.shape[0] * input_ids.shape[1]
 
-            self.total_prompt_tokens += input_ids.shape[0] * input_ids.shape[1]
+                output_ids = self.llm.generate(input_ids,
+                                        decoder_input_ids=self.decoder_input_ids,
+                                        max_new_tokens=2)
+                
+                self.total_completion_tokens += output_ids.shape[0] * output_ids.shape[1]
 
-            output_ids = self.llm.generate(input_ids,
-                                           decoder_input_ids=self.decoder_input_ids,
-                                           max_new_tokens=2)
+                output = self.tokenizer.batch_decode(output_ids, skip_special_tokens=True)
 
-            self.total_completion_tokens += output_ids.shape[0] * output_ids.shape[1]
-
-            output = self.tokenizer.batch_decode(output_ids, skip_special_tokens=True)
+                inference_cache[cache_key] = output
 
         elif self.config.model_type == 'llama':
             conversation0 = [{"role": "user", "content": input_texts[0]}]
@@ -179,64 +187,140 @@ Output Passage A or Passage B:"""
         self.total_compare = 0
         self.total_completion_tokens = 0
         self.total_prompt_tokens = 0
+        # Define the path for the pickle cache file
+        cache_path = 'allpair_cache.pkl'
+
+        # Load the cache if it exists, otherwise create an empty dictionary
+        if os.path.exists(cache_path):
+            with open(cache_path, 'rb') as cache_file:
+                inference_cache = pickle.load(cache_file)
+        else:
+            inference_cache = {}
+
         if self.method == "allpair":
             doc_pairs = list(combinations(ranking, 2))
-            allpairs = []
+            missing_pairs = []  # Collect only missing pairs for batch processing
+            print(f"Resolving query {query}")
             for doc1, doc2 in tqdm(doc_pairs):
-                allpairs.append(self.prompt.format(query=query, doc1=doc1.text, doc2=doc2.text))
-                allpairs.append(self.prompt.format(query=query, doc1=doc2.text, doc2=doc1.text))
+                input_text1 = self.prompt.format(query=query, doc1=doc1.text, doc2=doc2.text)
+                input_text2 = self.prompt.format(query=query, doc1=doc2.text, doc2=doc1.text)
 
-            allpairs_dataset = Text2TextGenerationDataset(allpairs, self.tokenizer)
+                # Generate tuple keys for caching
+                key1 = (self.model, input_text1)
+                key2 = (self.model, input_text2)
 
-            loader = DataLoader(
-                allpairs_dataset,
-                batch_size=self.batch_size,
-                collate_fn=DataCollatorWithPadding(
-                    self.tokenizer,
-                    max_length=512,
-                    padding='longest',
-                ),
-                shuffle=False,
-                drop_last=False,
-                num_workers=4
-            )
+                # Check if the tuple keys are already in the cache and collect missing ones
+                if key1 in inference_cache:
+                    output1 = inference_cache[key1]
+                    #print(key1[0])
+                else:
+                    output1 = None
+                    missing_pairs.append(key1)
 
-            outputs = []
-            for batch_inputs in tqdm(loader):
-                self.total_compare += 1
-                self.total_prompt_tokens += batch_inputs['input_ids'].shape[0] * batch_inputs['input_ids'].shape[1]
+                if key2 in inference_cache:
+                    output2 = inference_cache[key2]
+                    #print(key2[0])
 
-                batch_outputs = self.llm.generate(batch_inputs['input_ids'].to(self.llm.device),
-                                                  decoder_input_ids=self.decoder_input_ids
-                                                  if self.decoder_input_ids.shape[0] == len(batch_inputs['input_ids'])
-                                                  else self.decoder_input_ids[:len(batch_inputs['input_ids']), :], # last batch might be smaller
-                                                  max_new_tokens=2)
-                self.total_completion_tokens += batch_outputs.shape[0] * batch_outputs.shape[1]
-                outputs.extend(batch_outputs.cpu().numpy())
+                else:
+                    output2 = None
+                    missing_pairs.append(key2)
 
-            outputs = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
-            scores = defaultdict(float)
-            for i in range(0, len(outputs), 2):
-                doc1, doc2 = doc_pairs[i//2]
-                output1 = outputs[i]
-                output2 = outputs[i + 1]
-                if output1 == "Passage A" and output2 == "Passage B":
-                    scores[doc1.docid] += 1
-                elif output1 == "Passage B" and output2 == "Passage A":
-                    scores[doc2.docid] += 1
-                else:  # conflict
-                    scores[doc1.docid] += 0.5
-                    scores[doc2.docid] += 0.5
+            if missing_pairs:
+                # Prepare dataset using the input text parts of the keys
+                missing_texts = [key[1] for key in missing_pairs]
+                allpairs_dataset = Text2TextGenerationDataset(missing_texts, self.tokenizer)
+                loader = DataLoader(
+                    allpairs_dataset,
+                    batch_size=self.batch_size,
+                    collate_fn=DataCollatorWithPadding(
+                        self.tokenizer,
+                        max_length=512,
+                        padding='longest',
+                    ),
+                    shuffle=False,
+                    drop_last=False,
+                    num_workers=4
+                )
 
-            ranking = sorted([SearchResult(docid=docid, score=score, text=None) for docid, score in scores.items()],
-                             key=lambda x: x.score, reverse=True)
+                outputs = []
+                for batch_inputs in tqdm(loader):
+                    torch.cuda.empty_cache()  # Clear GPU cache at the start of each loop iteration
+
+                    self.total_compare += 1
+                    self.total_prompt_tokens += batch_inputs['input_ids'].shape[0] * batch_inputs['input_ids'].shape[1]
+                    batch_outputs = self.llm.generate(
+                        batch_inputs['input_ids'].to(self.llm.device),
+                        decoder_input_ids=self.decoder_input_ids if self.decoder_input_ids.shape[0] == len(batch_inputs['input_ids']) else self.decoder_input_ids[:len(batch_inputs['input_ids']), :],
+                        max_new_tokens=2
+                    )
+
+                    self.total_completion_tokens += batch_outputs.shape[0] * batch_outputs.shape[1]
+                    outputs.extend(batch_outputs.cpu().numpy())
+
+                outputs = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
+
+                # Update the cache with the new outputs, using tuple keys
+                for key, output in zip(missing_pairs, outputs):
+                    inference_cache[key] = output
+
+                # Save the updated cache back to the file
+                with open(cache_path, 'wb') as cache_file:
+                    pickle.dump(inference_cache, cache_file)
+
+
+
+                scores = defaultdict(float)
+                for i in range(0, len(outputs), 2):
+                    doc1, doc2 = doc_pairs[i//2]
+                    output1 = outputs[i]
+                    output2 = outputs[i + 1]
+                    if output1 == "Passage A" and output2 == "Passage B":
+                        scores[doc1.docid] += 1
+                    elif output1 == "Passage B" and output2 == "Passage A":
+                        scores[doc2.docid] += 1
+                    else:  # conflict
+                        scores[doc1.docid] += 0.5
+                        scores[doc2.docid] += 0.5
+
+                ranking = sorted([SearchResult(docid=docid, score=score, text=None) for docid, score in scores.items()],
+                                key=lambda x: x.score, reverse=True)
+            else:
+                print("skipping, using cached results.")
 
         elif self.method == "heapsort":
+            class ComparableDoc:
+                def __init__(self, docid, text, ranker):
+                    self.docid = docid
+                    self.text = text
+                    self.ranker = ranker
 
-            arr = [ComparableDoc(docid=doc.docid, text=doc.text, ranker=self, query) for doc in ranking]
+                def __gt__(self, other):
+                    out = self.ranker.compare(query, [self.text, other.text])
+                    if out[0] == "Passage A" and out[1] == "Passage B":
+                        return True
+                    else:
+                        return False
+
+            arr = [ComparableDoc(docid=doc.docid, text=doc.text, ranker=self) for doc in ranking]
             self.heapSort(arr, self.k)
             ranking = [SearchResult(docid=doc.docid, score=-i, text=None) for i, doc in enumerate(reversed(arr))]
 
+
+
+        #
+        # elif self.method == "bubblesort":
+        #     k = min(k, len(ranking))
+        #     for i in range(k):
+        #         current_ind = len(ranking) - 1
+        #         while True:
+        #             if current_ind == i:
+        #                 break
+        #             doc1 = ranking[current_ind]
+        #             doc2 = ranking[current_ind - 1]
+        #             output = self.compare(query, [doc1.text, doc2.text])
+        #             if output[0] == "Passage A" and output[1] == "Passage B":
+        #                 ranking[current_ind - 1], ranking[current_ind] = ranking[current_ind], ranking[current_ind - 1]
+        #             current_ind -= 1
         elif self.method == "bubblesort":
             k = min(self.k, len(ranking))
 

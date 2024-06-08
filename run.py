@@ -1,11 +1,15 @@
 import logging
+import datetime
+import csv
 import ir_datasets
 from pyserini.search.lucene import LuceneSearcher
 from pyserini.search._base import get_topics
+import torch
 from llmrankers.rankers import SearchResult
 from llmrankers.pointwise import PointwiseLlmRanker, MonoT5LlmRanker
 from llmrankers.setwise import SetwiseLlmRanker, OpenAiSetwiseLlmRanker
 from llmrankers.pairwise import PairwiseLlmRanker, DuoT5LlmRanker, OpenAiPairwiseLlmRanker
+from llmrankers.quicksort import Quicksort
 from llmrankers.listwise import OpenAiListwiseLlmRanker, ListwiseLlmRanker
 from tqdm import tqdm
 import argparse
@@ -13,6 +17,8 @@ import sys
 import json
 import time
 import random
+import os
+import pickle
 random.seed(929)
 logger = logging.getLogger(__name__)
 
@@ -39,7 +45,7 @@ def parse_args(parser, commands):
 
 
 def write_run_file(path, results, tag):
-    with open(path, 'w') as f:
+    with open(path+'.txt', 'w') as f:
         for qid, _, ranking in results:
             rank = 1
             for doc in ranking:
@@ -47,6 +53,18 @@ def write_run_file(path, results, tag):
                 score = doc.score
                 f.write(f"{qid}\tQ0\t{docid}\t{rank}\t{score}\t{tag}\n")
                 rank += 1
+
+
+
+
+def write_run_file_metadata(path, total_comparisons, total_inferences, toc, tic, reranked_results, total_prompt_tokens, total_completion_tokens):
+    with open(path+'_metadata.csv', 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['Total Comparisons', 'Total Prompt Tokens', 'Total Completion Tokens', 'Average Comparisons per Result', 'Average Inferences per Result', 'Average Prompt Tokens per Result', 'Average Completion Tokens per Result', 'Average Time per Result'])
+        writer.writerow([total_comparisons, total_prompt_tokens, total_completion_tokens, total_comparisons/len(reranked_results), total_inferences/len(reranked_results), total_prompt_tokens/len(reranked_results), total_completion_tokens/len(reranked_results), (toc-tic)/len(reranked_results)])
+
+
+
 
 
 def main(args):
@@ -86,7 +104,7 @@ def main(args):
                                       k=args.setwise.k)
 
     elif args.pairwise:
-        if args.pairwise.method != 'allpair':
+        if args.pairwise.method != 'allpair' and args.pairwise.method != 'quicksort':
             args.pairwise.batch_size = 2
             logger.info(f'Setting batch_size to 2.')
 
@@ -105,13 +123,23 @@ def main(args):
                                     batch_size=args.pairwise.batch_size,
                                     k=args.pairwise.k)
         else:
-            ranker = PairwiseLlmRanker(model_name_or_path=args.run.model_name_or_path,
-                                       tokenizer_name_or_path=args.run.tokenizer_name_or_path,
-                                       device=args.run.device,
-                                       cache_dir=args.run.cache_dir,
-                                       method=args.pairwise.method,
-                                       batch_size=args.pairwise.batch_size,
-                                       k=args.pairwise.k)
+            if args.pairwise.method == 'quicksort':
+                print('running quicksort...')
+                ranker = Quicksort(model_name_or_path=args.run.model_name_or_path,
+                          tokenizer_name_or_path=args.run.tokenizer_name_or_path,
+                          device = args.run.device,
+                          batch_size = args.pairwise.batch_size,
+                          k = args.pairwise.k,
+                          passage_length = args.run.passage_length)
+            else:
+            
+                ranker = PairwiseLlmRanker(model_name_or_path=args.run.model_name_or_path,
+                                        tokenizer_name_or_path=args.run.tokenizer_name_or_path,
+                                        device=args.run.device,
+                                        cache_dir=args.run.cache_dir,
+                                        method=args.pairwise.method,
+                                        batch_size=args.pairwise.batch_size,
+                                        k=args.pairwise.k)
 
     elif args.listwise:
         if args.run.openai_key:
@@ -131,7 +159,6 @@ def main(args):
                                        num_repeat=args.listwise.num_repeat)
     else:
         raise ValueError('Must specify either --pointwise, --setwise, --pairwise or --listwise.')
-
     query_map = {}
     if args.run.ir_dataset_name is not None:
         dataset = ir_datasets.load(args.run.ir_dataset_name)
@@ -177,11 +204,27 @@ def main(args):
 
     reranked_results = []
     total_comparisons = 0
+    total_inferences = 0
     total_prompt_tokens = 0
     total_completion_tokens = 0
 
+
+    # Ensure the cache file is loaded safely or initialized if problematic
+    cache_file = 'real_cache.pkl'
+    if os.path.exists(cache_file) and os.path.getsize(cache_file) > 0:
+        try:
+            with open(cache_file, 'rb') as f:
+                inference_run_cache = pickle.load(f)
+        except (EOFError, pickle.UnpicklingError):
+            inference_run_cache = {}
+            print("Cache file is corrupted or empty, starting with an empty cache.")
+    else:
+        inference_run_cache = {}
+
     tic = time.time()
+
     for qid, query, ranking in tqdm(first_stage_rankings):
+        torch.cuda.empty_cache()
         if args.run.shuffle_ranking is not None:
             if args.run.shuffle_ranking == 'random':
                 random.shuffle(ranking)
@@ -189,18 +232,60 @@ def main(args):
                 ranking = ranking[::-1]
             else:
                 raise ValueError(f'Invalid shuffle ranking method: {args.run.shuffle_ranking}.')
-        reranked_results.append((qid, query, ranker.rerank(query, ranking)))
-        total_comparisons += ranker.total_compare
-        total_prompt_tokens += ranker.total_prompt_tokens
-        total_completion_tokens += ranker.total_completion_tokens
+
+        # Generate cache key based on query and document IDs in the ranking
+        cache_key = (query, tuple(doc.docid for doc in ranking), args.run.model_name_or_path)
+        
+        # Check if the query and ranking are already in the cache
+        if cache_key in inference_run_cache:
+            reranked_ranking, cached_counters = inference_run_cache[cache_key]
+            reranked_results.append((qid, query, reranked_ranking))
+            # Retrieve counters from cache
+            total_comparisons += cached_counters['total_compare']
+            total_inferences += cached_counters['total_inference']
+            total_prompt_tokens += cached_counters['total_prompt_tokens']
+            total_completion_tokens += cached_counters['total_completion_tokens']
+        else:
+            reranked_ranking = ranker.rerank(query, ranking)
+            reranked_results.append((qid, query, reranked_ranking))
+            # Update counters
+            total_comparisons += ranker.total_compare
+            if hasattr(ranker, 'total_inference'):
+                total_inferences += ranker.total_inference
+            total_prompt_tokens += ranker.total_prompt_tokens
+            total_completion_tokens += ranker.total_completion_tokens
+            # Cache both reranked results and counters
+            if not hasattr(ranker, 'total_inference'):
+                ranker.total_inference = 0
+            inference_run_cache[cache_key] = (
+                reranked_ranking, 
+                {
+                    'total_compare': ranker.total_compare,
+                    'total_inference': ranker.total_inference,
+                    'total_prompt_tokens': ranker.total_prompt_tokens,
+                    'total_completion_tokens': ranker.total_completion_tokens
+                }
+            )
+
     toc = time.time()
 
     print(f'Avg comparisons: {total_comparisons/len(reranked_results)}')
-    print(f'Avg prompt tokens: {total_prompt_tokens/len(reranked_results)}')
+    print(f'Avg inference: {total_inferences/len(reranked_results)}')
+    print(f'Avg prompt tokens: {total_prompt_tokens/len(reranked_results)}') 
     print(f'Avg completion tokens: {total_completion_tokens/len(reranked_results)}')
     print(f'Avg time per query: {(toc-tic)/len(reranked_results)}')
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    file_saving_name = f"{args.run.model_name_or_path}_{timestamp}_{args.run.ir_dataset_name}".replace("/",'_')
+    write_run_file(file_saving_name, reranked_results, 'LLMRankers')
+    write_run_file_metadata(file_saving_name, total_comparisons, total_inferences, toc, tic, reranked_results, total_prompt_tokens, total_completion_tokens)
 
-    write_run_file(args.run.save_path, reranked_results, 'LLMRankers')
+    # Save the updated inference cache to file safely
+    try:
+        with open(cache_file, 'wb') as f:
+            pickle.dump(inference_run_cache, f)
+    except Exception as e:
+        print(f"Failed to save cache: {e}")
+
 
 
 if __name__ == '__main__':
@@ -209,7 +294,7 @@ if __name__ == '__main__':
 
     run_parser = commands.add_parser('run')
     run_parser.add_argument('--run_path', type=str, help='Path to the first stage run file (TREC format) to rerank.')
-    run_parser.add_argument('--save_path', type=str, help='Path to save the reranked run file (TREC format).')
+    #run_parser.add_argument('--save_path', type=str, help='Path to save the reranked run file (TREC format).')
     run_parser.add_argument('--model_name_or_path', type=str,
                             help='Path to the pretrained model or model identifier from huggingface.co/models')
     run_parser.add_argument('--tokenizer_name_or_path', type=str, default=None,
@@ -232,7 +317,7 @@ if __name__ == '__main__':
 
     pairwise_parser = commands.add_parser('pairwise')
     pairwise_parser.add_argument('--method', type=str, default='allpair',
-                                 choices=['allpair', 'heapsort', 'bubblesort'])
+                                 choices=['allpair', 'heapsort', 'bubblesort','quicksort'])
     pairwise_parser.add_argument('--batch_size', type=int, default=2)
     pairwise_parser.add_argument('--k', type=int, default=10)
 
@@ -257,3 +342,74 @@ if __name__ == '__main__':
     if arg_dict['run'] is None or sum(arg_dict[arg] is not None for arg in arg_dict) != 2:
         raise ValueError('Need to set --run and can only set one of --pointwise, --pairwise, --setwise, --listwise')
     main(args)
+
+
+    # query_map = {}
+    # if args.run.ir_dataset_name is not None:
+    #     dataset = ir_datasets.load(args.run.ir_dataset_name)
+    #     for query in dataset.queries_iter():
+    #         qid = query.query_id
+    #         text = query.text
+    #         query_map[qid] = ranker.truncate(text, args.run.query_length)
+    #     dataset = ir_datasets.load(args.run.ir_dataset_name)
+    #     docstore = dataset.docs_store()
+    # else:
+    #     topics = get_topics(args.run.pyserini_index+'-test')
+    #     for topic_id in list(topics.keys()):
+    #         text = topics[topic_id]['title']
+    #         query_map[str(topic_id)] = ranker.truncate(text, args.run.query_length)
+    #     docstore = LuceneSearcher.from_prebuilt_index(args.run.pyserini_index+'.flat')
+
+    # logger.info(f'Loading first stage run from {args.run.run_path}.')
+    # first_stage_rankings = []
+    # with open(args.run.run_path, 'r') as f:
+    #     current_qid = None
+    #     current_ranking = []
+    #     for line in tqdm(f):
+    #         qid, _, docid, _, score, _ = line.strip().split()
+    #         if qid != current_qid:
+    #             if current_qid is not None:
+    #                 first_stage_rankings.append((current_qid, query_map[current_qid], current_ranking[:args.run.hits]))
+    #             current_ranking = []
+    #             current_qid = qid
+    #         if len(current_ranking) >= args.run.hits:
+    #             continue
+    #         if args.run.ir_dataset_name is not None:
+    #             text = docstore.get(docid).text
+    #             if 'title' in dir(docstore.get(docid)):
+    #                 text = f'{docstore.get(docid).title} {text}'
+    #         else:
+    #             data = json.loads(docstore.doc(docid).raw())
+    #             text = data['text']
+    #             if 'title' in data:
+    #                 text = f'{data["title"]} {text}'
+    #         text = ranker.truncate(text, args.run.passage_length)
+    #         current_ranking.append(SearchResult(docid=docid, score=float(score), text=text))
+    #     first_stage_rankings.append((current_qid, query_map[current_qid], current_ranking[:args.run.hits]))
+
+    # reranked_results = []
+    # total_comparisons = 0
+    # total_prompt_tokens = 0
+    # total_completion_tokens = 0
+
+    # tic = time.time()
+    # for qid, query, ranking in tqdm(first_stage_rankings):
+    #     if args.run.shuffle_ranking is not None:
+    #         if args.run.shuffle_ranking == 'random':
+    #             random.shuffle(ranking)
+    #         elif args.run.shuffle_ranking == 'inverse':
+    #             ranking = ranking[::-1]
+    #         else:
+    #             raise ValueError(f'Invalid shuffle ranking method: {args.run.shuffle_ranking}.')
+    #     reranked_results.append((qid, query, ranker.rerank(query, ranking)))
+    #     total_comparisons += ranker.total_compare
+    #     total_prompt_tokens += ranker.total_prompt_tokens
+    #     total_completion_tokens += ranker.total_completion_tokens
+    # toc = time.time()
+
+    # print(f'Avg comparisons: {total_comparisons/len(reranked_results)}')
+    # print(f'Avg prompt tokens: {total_prompt_tokens/len(reranked_results)}')
+    # print(f'Avg completion tokens: {total_completion_tokens/len(reranked_results)}')
+    # print(f'Avg time per query: {(toc-tic)/len(reranked_results)}')
+
+    # write_run_file(args.run.save_path, reranked_results, 'LLMRankers')
