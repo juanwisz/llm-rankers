@@ -118,67 +118,47 @@ class NumericComparator(BaseComparator):
     def compare(self, item1, item2):
         return item1 > item2
 
-# class DocumentComparator(BaseComparator):
-#     def __init__(self, model, inference_cache, key = 'text'):
-#         super().__init__()
-#         self.model = model
-#         self.inference_cache = inference_cache
-#         self.key = key
-
-#     def compare_batch(self, docs, pivot):
-#         results = []
-#         for doc in docs:
-#             try:
-#                 self.compare(getattr(doc,self.key), getattr(pivot,self.key))
-#             except:
-#                 print('hola')
-#                 pass
-#             result = self.compare(getattr(doc,self.key), getattr(pivot,self.key))
-#             results.append(result)
-#         self.batch_lengths.append(len(docs))
-#         self.count += len(docs)
-#         return results
-
-#     def compare(self, doc1, doc2):
-#         compare_key = (self.model, f'Given a query "{self.query}", which of the following two passages is more relevant to the query?\n\nPassage A: "{doc1}"\n\nPassage B: "{doc2}"\n\nOutput Passage A or Passage B:')
-#         if compare_key not in self.inference_cache:
-#             raise KeyError(f"Comparison result for {compare_key} not found in inference cache")
-#         #else:
-#             #print(compare_key)
-#         return self.inference_cache[compare_key] == "Passage A"
 class DocumentComparator(BaseComparator):
-    def __init__(self, model, inference_cache, key = 'text'):
+    def __init__(self, model, inference_cache, key='text'):
         super().__init__()
         self.model = model
         self.inference_cache = inference_cache
         self.key = key
-        self.error_keys = set()  # New set to store keys that cause errors
+        self.error_keys = set()
+        self.query = ""  # Initialize query attribute
 
     def compare_batch(self, docs, pivot):
         results = []
         for doc in docs:
             try:
-                result = self.compare(getattr(doc, self.key), getattr(pivot, self.key))
+                result = self.compare(doc, pivot)
                 results.append(result)
             except KeyError as e:
-                #print(e)
-                self.error_keys.add(str(e))  # Add the problematic key to the set
-                results.append(False)  # Default comparison result
+                self.error_keys.add(str(e))
+                results.append(False)
             except Exception as e:
                 print(f"Unexpected error in compare_batch: {e}")
-                results.append(False)  # Default comparison result
+                results.append(False)
         self.batch_lengths.append(len(docs))
         self.count += len(docs)
-        #self.print_error_keys()
         return results
 
     def compare(self, doc1, doc2):
-        compare_key = (self.model, f'Given a query "{self.query}", which of the following two passages is more relevant to the query?\n\nPassage A: "{doc1}"\n\nPassage B: "{doc2}"\n\nOutput Passage A or Passage B:')
+        # Ensure doc1 and doc2 are SearchResult objects
+        if not isinstance(doc1, SearchResult) or not isinstance(doc2, SearchResult):
+            raise TypeError("Both arguments must be SearchResult objects")
+
+        # Extract the text from the SearchResult objects
+        text1 = getattr(doc1, self.key)
+        text2 = getattr(doc2, self.key)
+
+        compare_key = (self.model, f'Given a query "{self.query}", which of the following two passages is more relevant to the query?\n\nPassage A: "{text1}"\n\nPassage B: "{text2}"\n\nOutput Passage A or Passage B:')
+        
         try:
             return self.inference_cache[compare_key] == "Passage A"
         except KeyError:
-            self.error_keys.add(str(compare_key))  # Add the problematic key to the set
-            raise  # Re-raise the KeyError to be caught in compare_batch
+            self.error_keys.add(str(compare_key))
+            raise
 
     def print_error_keys(self):
         print("Keys that caused KeyErrors:")
@@ -506,7 +486,7 @@ config = {
 
 model = 'google/flan-t5-large'
 comparator = DocumentComparator(model, inference_cache)
-sorting_algorithm = QuickSort(comparator)
+sorting_algorithm = QuickInsertionMixedSort(comparator)
 
 ranker = Rank(sorting_algorithm, config)
 ranker.run()
