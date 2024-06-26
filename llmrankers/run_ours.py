@@ -165,16 +165,35 @@ class DocumentComparator(BaseComparator):
         for key in self.error_keys:
             print(key)
 
+import random
+
 class QuickSort(SortingAlgorithm):
-    def __init__(self, comparator):
+    def __init__(self, comparator, pivot_strategy='original'):
         self.comparator = comparator
+        self.set_pivot_strategy(pivot_strategy)
+
+    def set_pivot_strategy(self, strategy):
+        if strategy == 'original':
+            self.pivot_strategy = self.original_pivot
+        elif strategy == 'middle':
+            self.pivot_strategy = self.middle_pivot
+        elif strategy == 'random':
+            self.pivot_strategy = self.random_pivot
+        elif strategy == 'median_of_three':
+            self.pivot_strategy = self.median_of_three_pivot
+        else:
+            raise ValueError("Invalid pivot strategy")
 
     def sort(self, data, k=None):
         if k is None:
             self.quick_sort(data, 0, len(data) - 1)
             return data
         else:
-            return self.quickselect(data, 0, len(data) - 1, k-1)
+            if k > len(data):
+                k = len(data)
+            self.quickselect(data, 0, len(data) - 1, k-1)
+            self.quick_sort(data, 0, k-1)
+            return data[:k]
 
     def quick_sort(self, data, low, high):
         if low < high:
@@ -183,6 +202,8 @@ class QuickSort(SortingAlgorithm):
             self.quick_sort(data, pi + 1, high)
 
     def partition(self, data, low, high):
+        pivot_index = self.pivot_strategy(data, low, high)
+        data[pivot_index], data[high] = data[high], data[pivot_index]
         pivot = data[high]
         all_data = data[low:high]
         results = self.comparator.compare_batch(all_data, pivot)
@@ -196,14 +217,41 @@ class QuickSort(SortingAlgorithm):
 
     def quickselect(self, data, low, high, index):
         if low == high:
-            return data[:index+1]
+            return
         pivot_index = self.partition(data, low, high)
         if index == pivot_index:
-            return data[:pivot_index+1]
+            return
         elif index < pivot_index:
-            return self.quickselect(data, low, pivot_index - 1, index)
+            self.quickselect(data, low, pivot_index - 1, index)
         else:
-            return self.quickselect(data, pivot_index + 1, high, index)
+            self.quickselect(data, pivot_index + 1, high, index)
+
+    # Pivot selection strategies
+    def original_pivot(self, data, low, high):
+        return high
+
+    def middle_pivot(self, data, low, high):
+        return (low + high) // 2
+
+    def random_pivot(self, data, low, high):
+        return random.randint(low, high)
+
+    def median_of_three_pivot(self, data, low, high):
+        mid = (low + high) // 2
+        if self.comparator.compare(data[low], data[mid]):
+            if self.comparator.compare(data[mid], data[high]):
+                return mid
+            elif self.comparator.compare(data[low], data[high]):
+                return high
+            else:
+                return low
+        else:
+            if self.comparator.compare(data[low], data[high]):
+                return low
+            elif self.comparator.compare(data[mid], data[high]):
+                return high
+            else:
+                return mid
 
 class InsertionSort(SortingAlgorithm):
     def __init__(self, comparator):
@@ -473,7 +521,7 @@ class Rank:
 config = {
     'input_run': 'run.msmarco-v1-passage.bm25-default.dl20.txt',
     'output_file': 'run.pairwise.quicksort_mix.txt',
-    'model_name': 'google/flan-t5-large',
+    'model_name': 'google/flan-t5-xl',
     'device': 'auto',
     'topics':'dl20',
     'input_run':'run.msmarco-v1-passage.bm25-default.dl20.txt',
@@ -486,11 +534,29 @@ config = {
 
 model = 'google/flan-t5-large'
 comparator = DocumentComparator(model, inference_cache)
-sorting_algorithm = QuickInsertionMixedSort(comparator)
+sorting_algorithm = QuickSort(comparator, pivot_strategy='median_of_three')
 
-ranker = Rank(sorting_algorithm, config)
-ranker.run()
-ranker.evaluate_run()
+# ranker = Rank(sorting_algorithm, config)
+# ranker.run()
+# ranker.evaluate_run()
+#Assuming the necessary classes are already defined as provided in your initial code
+
+# Create an instance of NumericComparator
+numeric_comparator = NumericComparator()
+
+# Create an instance of QuickSort using NumericComparator
+quick_sort = QuickSort(numeric_comparator)
+
+# Sample list of numbers to sort
+numbers = [42, 15, 8, 23, 16, 4, 42, 15, 37, 19, 99, 1]
+
+# Sort the list of numbers using QuickSort
+sorted_numbers = quick_sort.sort(numbers)
+
+# Print the sorted numbers
+print("Sorted numbers:", sorted_numbers)
+
+
 # %%
 # def find_keys_with_passage(inference_cache, passage_text):
 #     matching_keys = []
