@@ -536,25 +536,25 @@ model = 'google/flan-t5-large'
 comparator = DocumentComparator(model, inference_cache)
 sorting_algorithm = QuickSort(comparator, pivot_strategy='median_of_three')
 
-# ranker = Rank(sorting_algorithm, config)
-# ranker.run()
-# ranker.evaluate_run()
+ranker = Rank(sorting_algorithm, config)
+ranker.run()
+ranker.evaluate_run()
 #Assuming the necessary classes are already defined as provided in your initial code
 
-# Create an instance of NumericComparator
-numeric_comparator = NumericComparator()
+# # Create an instance of NumericComparator
+# numeric_comparator = NumericComparator()
 
-# Create an instance of QuickSort using NumericComparator
-quick_sort = QuickSort(numeric_comparator)
+# # Create an instance of QuickSort using NumericComparator
+# quick_sort = QuickSort(numeric_comparator)
 
-# Sample list of numbers to sort
-numbers = [42, 15, 8, 23, 16, 4, 42, 15, 37, 19, 99, 1]
+# # Sample list of numbers to sort
+# numbers = [42, 15, 8, 23, 16, 4, 42, 15, 37, 19, 99, 1]
 
-# Sort the list of numbers using QuickSort
-sorted_numbers = quick_sort.sort(numbers)
+# # Sort the list of numbers using QuickSort
+# sorted_numbers = quick_sort.sort(numbers)
 
-# Print the sorted numbers
-print("Sorted numbers:", sorted_numbers)
+# # Print the sorted numbers
+# print("Sorted numbers:", sorted_numbers)
 
 
 # %%
